@@ -17,6 +17,11 @@ import gc
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+import dion 
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 torch.empty(
     1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
@@ -851,8 +856,9 @@ class DistAdam(torch.optim.Optimizer):
         p_slice.add_(other=update, alpha=-1.0)  # p_slice -= update
 
     @torch.no_grad()
-    def step(self, muon_opt):
-        muon_opt.step_p1()
+    def step(self, muon_opt=None):
+        if muon_opt is not None:
+            muon_opt.step_p1()
         rank = dist.get_rank()
         all_gather_futures: list[torch.Future] = []
 
@@ -899,13 +905,16 @@ class DistAdam(torch.optim.Optimizer):
                         all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
         self._reduce_scatter_futures.clear()
 
-        muon_opt.step_p2()
+        if muon_opt is not None:
+            muon_opt.step_p2()
         torch.futures.collect_all(all_gather_futures).wait()
 
         if last_param is not None:
             last_all_gather_future = dist.all_gather_into_tensor(last_param, last_p_slice, async_op=True).get_future()
-        muon_opt.step_p3()
-        torch.futures.collect_all([last_all_gather_future]).wait()
+        if muon_opt is not None:
+            muon_opt.step_p3()
+        if last_param is not None:
+            torch.futures.collect_all([last_all_gather_future]).wait()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -1773,15 +1782,10 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
 
 class TrainingManager():
     """
-    Manages three optimizers for Adam embed/lm_head, Adam scalars, and Muon weight matrices.
+    Manages NorMuon for matrix weights and DistAdam for non-matrix parameters.
     Notable Features:
-        1. Scalars are given higher momentum terms to smooth learning @ChrisJMcCormick
-        2. Scalar weights are temporarily frozen during batch size or window size updates @ChrisJMcCormick
-        3. Adam optimizers are only stepped on odd steps @classiclarryd
-        4. Adam optimizers have hooks to start gradient communication during backwards pass @akash5474
-        5. Muon has a linear momentum warmup and cooldown schedule
-        6. Learning rates follow a linear decay schedule
-        7. Embed/lm_head weights and optimizer state splits at 2/3 of training @classiclarryd
+        1. Learning rates follow a linear decay schedule
+        2. Embed/lm_head weights and optimizer state splits at 2/3 of training @classiclarryd
 
     Manages model architecture, data, and target that changes during training
     Notable Features:
@@ -1795,6 +1799,7 @@ class TrainingManager():
     def __init__(self, model):
         self.mtp_weights_schedule = self._build_mtp_schedule()
         self.model = model
+        dion_labels = ['attn', 'mlp']
         adam_betas = {
             'lm_head': [0.5, 0.95],
             'smear_gate': [0.9, 0.99],
@@ -1808,24 +1813,60 @@ class TrainingManager():
         }
         adam_labels = list(adam_betas.keys())
         adam_beta_values = list(adam_betas.values())
-        muon_labels = ['attn', 'mlp']
-        adam_params = [p for p in model.parameters() if getattr(p, 'label', None) in adam_labels]
-        muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
-        assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + muon_labels), "All params must have label"
+
+        params_by_label = defaultdict(list)
+        for param in model.parameters():
+            params_by_label[getattr(param, 'label', None)].append(param)
+
+        expected_labels = set(adam_labels + dion_labels)
+        assert set(params_by_label.keys()) == expected_labels, "All params must have label"
+
+        dion_params = [p for label in dion_labels for p in params_by_label[label]]
+        adam_params = [p for label in adam_labels for p in params_by_label[label]]
+
+        dion_param_groups = [
+            dict(
+                params=params_by_label["attn"],
+                lr=0.023,
+                weight_decay=1.2,
+                muon_beta2=0.95,
+                cautious_wd=True,
+                fraction=.5,
+                ef_decay = 0
+
+            ),
+            dict(
+                params=params_by_label["mlp"],
+                lr=0.023,
+                weight_decay=1.2,
+                muon_beta2=0.95,
+                cautious_wd=True,
+                fraction=.5,
+                ef_decay = 0
+            ),
+        ]
 
         self.adam_opt = DistAdam(adam_params, adam_labels, adam_beta_values, lr=0.008, eps=1e-10, weight_decay=0.005)
-        self.muon_opt = NorMuon(muon_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)
-        self.optimizers = [self.adam_opt, self.muon_opt]
+        process_group = dist.group.WORLD if dist.is_initialized() else None
+        self.dion_opt = dion.NorDion2(
+            dion_param_groups,
+            distributed_mesh=process_group,
+            # use_triton=True,
+            # adjust_lr=None,
+        )
+        self.optimizers = [self.adam_opt, self.dion_opt]
+        self.dion_optim_time_ms = 0.0
+        self.dion_optim_steps = 0
+        self.last_dion_optim_ms = 0.0
 
         # split after odd number step
         self.split_step = math.ceil(args.split_embed_frac * args.num_scheduled_iterations) | 1
 
         # set defaults
-        for opt in self.optimizers:
-            opt.odd_step_only = False 
-            opt.should_sync = True
-            for group in opt.param_groups:
-                group["initial_lr"] = group["lr"]
+        for group in self.adam_opt.param_groups:
+            group["initial_lr"] = group["lr"]
+        for group in self.dion_opt.param_groups:
+            group["initial_lr"] = group["lr"]
 
         # on even steps, only step Muon params
         self.adam_opt.odd_step_only = True
@@ -1858,7 +1899,10 @@ class TrainingManager():
         )
     
     def _is_active_step(self, opt, step: int):
-        return (opt.odd_step_only and step%2==1) or not opt.odd_step_only
+        return (opt.odd_step_only and step % 2 == 1) or not opt.odd_step_only
+
+    def _copy_lm_to_embed(self):
+        self.adam_opt.copy_lm_to_embed()
 
     def get_transition_steps(self):
         transition_steps = []
@@ -1888,39 +1932,45 @@ class TrainingManager():
     def step_optimizers(self, step: int):                
         step_lr = get_lr(step)
         muon_momentum = get_muon_momentum(step)
-        for group in self.muon_opt.param_groups:
+        frac_switch_step = args.num_iterations // 2
+        dion_fraction = 1.0 if step < frac_switch_step else 0.33
+        for group in self.adam_opt.param_groups:
+            group["lr"] = group["initial_lr"] * step_lr
+        for group in self.dion_opt.param_groups:
+            group["lr"] = group["initial_lr"] * step_lr
             group["momentum"] = muon_momentum
-
-        for opt in self.optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * step_lr
-                
+            group["fraction"] = dion_fraction
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0_opt = time.perf_counter()
+        self.dion_opt.step()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.last_dion_optim_ms = 1000 * (time.perf_counter() - t0_opt)
+        self.dion_optim_time_ms += self.last_dion_optim_ms
+        self.dion_optim_steps += 1
         if self._is_active_step(self.adam_opt, step):
-            # adam will interleave calls to muon step
-            self.adam_opt.step(self.muon_opt)
+            self.adam_opt.step()
             self.model.zero_grad(set_to_none=True)
             self.adam_opt.should_sync = False
         else:
-            self.muon_opt.step()
-            self.muon_opt.zero_grad(set_to_none=True)
-            
+            self.dion_opt.zero_grad(set_to_none=True)
+
         if step == self.split_step:
-            self.adam_opt.copy_lm_to_embed()
+            self._copy_lm_to_embed()
             self.model.split_embed = True
     
     def activate_hooks(self, step: int):
-        for opt in self.optimizers:
-            if self._is_active_step(opt, step):
-                opt.should_sync = True
+        if self._is_active_step(self.adam_opt, step):
+            self.adam_opt.should_sync = True
 
     def reset(self, state=None):
         if state is not None:
             for opt, opt_state in zip(self.optimizers, state):
-                opt.should_sync = False
                 opt.load_state_dict(opt_state)
 
-        # muon momentum buffers not in state dict
-        self.muon_opt.reset()
+        self.dion_opt.reset()
+        self.adam_opt.should_sync = False
         self.model.split_embed = False
 
         self.ws_short, self.ws_long = get_ws(0)
@@ -1953,7 +2003,7 @@ class Hyperparameters:
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = 50  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
@@ -1992,6 +2042,15 @@ def print0(s, console=False):
             if console:
                 print(s)
             print(s, file=f)
+
+wandb_run = None
+if master_process and wandb is not None:
+    wandb_run = wandb.init(
+        project=os.environ.get("WANDB_PROJECT", "modded-nanogpt"),
+        name=args.run_id,
+        config=vars(args),
+        mode=os.environ.get("WANDB_MODE", "online"),
+    )
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -2097,7 +2156,15 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        opt_avg_ms = training_manager.dion_optim_time_ms / max(training_manager.dion_optim_steps, 1)
+        print0(
+            f"step:{step}/{train_steps} val_loss:{val_loss:.4f} "
+            f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms "
+            f"dion_opt_avg:{opt_avg_ms:.2f}ms dion_opt_last:{training_manager.last_dion_optim_ms:.2f}ms",
+            console=True,
+        )
+        if master_process and wandb_run is not None:
+            wandb_run.log({"val/loss": float(val_loss)}, step=step)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2112,19 +2179,36 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    train_loss = 0.0
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
         if idx == grad_accum_steps - 1:
             training_manager.activate_hooks(step)
         send_args = training_manager.train_loader_send_args
         inputs, targets, cum_seqlens = train_loader.send(send_args)
-        (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        loss = model(inputs, targets, cum_seqlens, training_manager.get_forward_args())
+        train_loss += loss.detach()
+        (loss / grad_accum_steps).backward()
+    train_loss = train_loss / grad_accum_steps
+    dist.reduce(train_loss, 0, op=dist.ReduceOp.AVG)
     training_manager.step_optimizers(step)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    if master_process and wandb_run is not None:
+        dion_opt_avg_ms = training_manager.dion_optim_time_ms / max(training_manager.dion_optim_steps, 1)
+        wandb_run.log(
+            {
+                "train/loss": float(train_loss),
+                "perf/dion_opt_last_ms": training_manager.last_dion_optim_ms,
+                "perf/dion_opt_avg_ms": dion_opt_avg_ms,
+            },
+            step=step + 1,
+        )
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+if master_process and wandb_run is not None:
+    wandb_run.finish()
 dist.destroy_process_group()
