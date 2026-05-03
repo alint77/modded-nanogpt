@@ -61,13 +61,6 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
-class Linear(nn.Linear):
-    def __init__(self, in_features, out_features):
-        super().__init__(in_features, out_features, bias=True)
-    
-    def forward(self, x):
-        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
-
 class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -75,6 +68,13 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         return (norm(x.float()) * self.gains).type_as(x)
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int):
@@ -126,7 +126,7 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor):
         x = self.fc(x)
-        x = F.relu(x).square()
+        x = x.relu().square()
         x = self.proj(x)
         return x
 
@@ -185,18 +185,20 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     return X
 
 @torch.compile
-def muon_update(grad, momentum, beta=0.95, nesterov=True):
-    momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
+def muon_sq_update(grad, momentum, v, mu=0.95, beta2=0.95, eps=1e-10, nesterov=True):
+    momentum.lerp_(grad, 1 - mu)
+    v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+    update = grad.lerp_(momentum, mu) if nesterov else momentum
+    update = update / (v.sqrt() + eps)
     update = zeropower_via_newtonschulz5(update)
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
 
-class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+class MuonSq(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, beta2=0.95, eps=1e-10):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, beta2=beta2, eps=eps)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -206,13 +208,15 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             params = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
-            for base_i in range(len(params))[::world_size]:
+            for base_i in range(0, len(params), world_size):
                 if base_i + rank < len(params):
                     p = params[base_i + rank]
                     state = self.state[p]
                     if len(state) == 0:
-                        state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                        state["momentum"] = torch.zeros_like(p)
+                        state["v"] = torch.zeros_like(p)
+                    update = muon_sq_update(p.grad, state["momentum"], state["v"],
+                                            mu=group["mu"], beta2=group["beta2"], eps=group["eps"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
@@ -237,16 +241,17 @@ if dist.get_rank() == 0:
     print(logfile)
 def print0(s, console=False, log=True):
     if dist.get_rank() == 0:
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            if log:
+        if console:
+            print(s)
+        if log:
+            with open(logfile, "a") as f:
                 print(s, file=f)
 
 # we begin by logging this file itself
 print0(code)
 print0("="*100)
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+print0(f"Running on device_name={torch.cuda.get_device_name(device)} with world_size={dist.get_world_size()}")
 print0("="*100)
 
 val_tokens = 20 * 524288
@@ -264,21 +269,20 @@ model.compile(dynamic=False)
 ########################################
 
 # we want to minimize this while still reaching 3.28 val loss
-train_steps = 3550
+train_steps = 3325
 
 # initialize model parameters
 for name, p in model.named_parameters():
     if "proj" in name:
         p.data.zero_()
-    dist.broadcast(p.detach(), 0)
 
 # create the optimizer(s)
 optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
                     dict(params=[model.proj.weight], lr=1/320),
                     dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                    betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
-optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                  lr=0.02, weight_decay=0.01)
+optimizer2 = MuonSq([p for p in model.blocks.parameters() if p.ndim >= 2],
+                    lr=0.10, weight_decay=0.0125)
 optimizers = [optimizer1, optimizer2]
 assert set(p for opt in optimizers for group in opt.param_groups
            for p in group["params"]) == set(model.parameters())
@@ -287,25 +291,30 @@ for opt in optimizers:
         group["initial_lr"] = group["lr"]
 
 # learning rate schedule: stable then decay
-def get_lr(step: int, cooldown_frac=0.7):
+def set_hparams(step, cooldown_frac=0.7):
     progress = step / train_steps
     assert 0 <= progress < 1
     if progress < 1 - cooldown_frac:
-        return 1.0
+        eta = 1.0
     else:
-        return (1 - progress) / cooldown_frac
+        eta = (1 - progress) / cooldown_frac
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * eta
 
 
 ########################################
 #        Training and Validation       #
 ########################################
 
-training_time = 0
+for p in model.parameters():
+    dist.broadcast(p.detach(), 0)
 # start the clock
+training_time = 0
 dist.barrier()
 t0 = time.perf_counter()
 for step in range(train_steps + 1):
-    
+
     # --------------- VALIDATION SECTION -----------------
     if step == train_steps or step % 125 == 0:
         # stop the clock
@@ -325,7 +334,7 @@ for step in range(train_steps + 1):
         # start the clock again
         dist.barrier()
         t0 = time.perf_counter()
-    
+
     if step == train_steps:
         break
 
@@ -339,9 +348,8 @@ for step in range(train_steps + 1):
         assert p.grad is not None, name
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
     # set optimization hyperparameters and take a step
+    set_hparams(step)
     for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
         opt.step()
     model.zero_grad(set_to_none=True)
     approx_training_time = training_time + (time.perf_counter() - t0)
@@ -351,35 +359,34 @@ for step in range(train_steps + 1):
 dist.destroy_process_group()
 
 ====================================================================================================
-Running PyTorch 2.10.0+cu128 compiled for CUDA 12.8
+Running PyTorch 2.9.1 compiled for CUDA 12.8
+Running on device_name=NVIDIA B200 with world_size=8
 ====================================================================================================
-step:0/3550 val_loss:10.82584 train_time:0.000s step_avg:0.25ms
-step:125/3550 val_loss:4.61949 train_time:22.088s step_avg:176.71ms
-step:250/3550 val_loss:4.09671 train_time:41.340s step_avg:165.36ms
-step:375/3550 val_loss:3.91616 train_time:60.463s step_avg:161.23ms
-step:500/3550 val_loss:3.81069 train_time:79.592s step_avg:159.18ms
-step:625/3550 val_loss:3.74034 train_time:98.703s step_avg:157.92ms
-step:750/3550 val_loss:3.68991 train_time:117.799s step_avg:157.06ms
-step:875/3550 val_loss:3.64930 train_time:136.921s step_avg:156.48ms
-step:1000/3550 val_loss:3.61105 train_time:156.044s step_avg:156.04ms
-step:1125/3550 val_loss:3.58477 train_time:175.150s step_avg:155.69ms
-step:1250/3550 val_loss:3.55282 train_time:194.278s step_avg:155.42ms
-step:1375/3550 val_loss:3.52679 train_time:213.416s step_avg:155.21ms
-step:1500/3550 val_loss:3.50058 train_time:232.522s step_avg:155.01ms
-step:1625/3550 val_loss:3.48001 train_time:251.652s step_avg:154.86ms
-step:1750/3550 val_loss:3.45831 train_time:270.794s step_avg:154.74ms
-step:1875/3550 val_loss:3.43975 train_time:289.902s step_avg:154.61ms
-step:2000/3550 val_loss:3.42290 train_time:309.043s step_avg:154.52ms
-step:2125/3550 val_loss:3.40720 train_time:328.168s step_avg:154.43ms
-step:2250/3550 val_loss:3.39183 train_time:347.277s step_avg:154.35ms
-step:2375/3550 val_loss:3.37838 train_time:366.407s step_avg:154.28ms
-step:2500/3550 val_loss:3.36493 train_time:385.516s step_avg:154.21ms
-step:2625/3550 val_loss:3.35171 train_time:404.609s step_avg:154.14ms
-step:2750/3550 val_loss:3.33939 train_time:423.734s step_avg:154.08ms
-step:2875/3550 val_loss:3.32761 train_time:442.928s step_avg:154.06ms
-step:3000/3550 val_loss:3.31602 train_time:462.040s step_avg:154.01ms
-step:3125/3550 val_loss:3.30465 train_time:481.192s step_avg:153.98ms
-step:3250/3550 val_loss:3.29434 train_time:500.313s step_avg:153.94ms
-step:3375/3550 val_loss:3.28602 train_time:519.423s step_avg:153.90ms
-step:3500/3550 val_loss:3.28033 train_time:538.552s step_avg:153.87ms
-step:3550/3550 val_loss:3.27940 train_time:546.199s step_avg:153.86ms
+step:0/3325 val_loss:10.82584 train_time:0.000s step_avg:0.05ms
+step:125/3325 val_loss:4.80839 train_time:18.993s step_avg:151.95ms
+step:250/3325 val_loss:4.22841 train_time:31.951s step_avg:127.80ms
+step:375/3325 val_loss:3.97894 train_time:44.913s step_avg:119.77ms
+step:500/3325 val_loss:3.85642 train_time:57.851s step_avg:115.70ms
+step:625/3325 val_loss:3.78181 train_time:70.813s step_avg:113.30ms
+step:750/3325 val_loss:3.73316 train_time:83.757s step_avg:111.68ms
+step:875/3325 val_loss:3.69302 train_time:96.713s step_avg:110.53ms
+step:1000/3325 val_loss:3.65758 train_time:109.693s step_avg:109.69ms
+step:1125/3325 val_loss:3.63009 train_time:122.640s step_avg:109.01ms
+step:1250/3325 val_loss:3.59671 train_time:135.585s step_avg:108.47ms
+step:1375/3325 val_loss:3.56919 train_time:148.562s step_avg:108.05ms
+step:1500/3325 val_loss:3.54266 train_time:161.520s step_avg:107.68ms
+step:1625/3325 val_loss:3.52258 train_time:174.490s step_avg:107.38ms
+step:1750/3325 val_loss:3.50024 train_time:187.462s step_avg:107.12ms
+step:1875/3325 val_loss:3.47920 train_time:200.422s step_avg:106.89ms
+step:2000/3325 val_loss:3.45922 train_time:213.393s step_avg:106.70ms
+step:2125/3325 val_loss:3.43997 train_time:226.350s step_avg:106.52ms
+step:2250/3325 val_loss:3.42234 train_time:239.296s step_avg:106.35ms
+step:2375/3325 val_loss:3.40488 train_time:252.259s step_avg:106.21ms
+step:2500/3325 val_loss:3.38740 train_time:265.224s step_avg:106.09ms
+step:2625/3325 val_loss:3.36786 train_time:278.174s step_avg:105.97ms
+step:2750/3325 val_loss:3.34951 train_time:291.139s step_avg:105.87ms
+step:2875/3325 val_loss:3.33139 train_time:304.111s step_avg:105.78ms
+step:3000/3325 val_loss:3.31272 train_time:317.065s step_avg:105.69ms
+step:3125/3325 val_loss:3.29426 train_time:330.031s step_avg:105.61ms
+step:3250/3325 val_loss:3.27957 train_time:343.019s step_avg:105.54ms
+step:3325/3325 val_loss:3.27523 train_time:350.817s step_avg:105.51ms
